@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from copy import deepcopy
 from typing import Tuple
 
@@ -33,6 +34,16 @@ def _evaluate_multitask(model: TaskConditionedTCN, loader: DataLoader, profile_b
     return float(np.mean(losses)) if losses else float("inf")
 
 
+def _attach_training_artifacts(model: torch.nn.Module, history: list[dict[str, float]], best_epoch: int, best_val_loss: float, duration_sec: float) -> None:
+    model._training_history = history
+    model._training_summary = {
+        "best_epoch": int(best_epoch),
+        "best_val_loss": float(best_val_loss),
+        "duration_sec": float(duration_sec),
+        "epochs_ran": int(len(history)),
+    }
+
+
 def train_multitask_pretrain(
     model: TaskConditionedTCN,
     train_loader: DataLoader,
@@ -44,14 +55,18 @@ def train_multitask_pretrain(
     weight_decay: float = 1e-5,
     patience: int = 4,
 ) -> TaskConditionedTCN:
+    start_time = time.perf_counter()
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.MSELoss()
     best_loss = float("inf")
     best_state = deepcopy(model.state_dict())
+    best_epoch = 0
     wait = 0
-    for _ in range(epochs):
+    history: list[dict[str, float]] = []
+    for epoch in range(epochs):
         model.train()
+        train_losses = []
         for x_feat, x_tgt, y, task_idx in train_loader:
             profiles = profile_bank[task_idx.to(device)]
             pred = model(x_feat.to(device), x_tgt.to(device), profiles)
@@ -60,16 +75,28 @@ def train_multitask_pretrain(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            train_losses.append(float(loss.item()))
         val_loss = _evaluate_multitask(model, val_loader, profile_bank, device)
+        train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
+        history.append(
+            {
+                "epoch": float(epoch + 1),
+                "train_loss": train_loss,
+                "val_loss": float(val_loss),
+                "best_val_loss_so_far": float(min(best_loss, val_loss)),
+            }
+        )
         if val_loss < best_loss:
             best_loss = val_loss
             best_state = deepcopy(model.state_dict())
+            best_epoch = epoch + 1
             wait = 0
         else:
             wait += 1
             if wait >= patience:
                 break
     model.load_state_dict(best_state)
+    _attach_training_artifacts(model, history, best_epoch, best_loss, time.perf_counter() - start_time)
     return model
 
 
@@ -112,6 +139,7 @@ def train_local_model(
     weight_decay: float = 1e-5,
     patience: int = 4,
 ) -> TaskConditionedTCN:
+    start_time = time.perf_counter()
     model = model.to(device)
     model = configure_trainable_parts(model, mode=trainable_parts)
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -119,9 +147,12 @@ def train_local_model(
     criterion = nn.MSELoss()
     best_loss = float("inf")
     best_state = deepcopy(model.state_dict())
+    best_epoch = 0
     wait = 0
-    for _ in range(epochs):
+    history: list[dict[str, float]] = []
+    for epoch in range(epochs):
         model.train()
+        train_losses = []
         for x_feat, x_tgt, y in train_loader:
             pred = model(
                 x_feat.to(device),
@@ -133,16 +164,28 @@ def train_local_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            train_losses.append(float(loss.item()))
         val_loss = _evaluate_local(model, val_loader, profile, device)
+        train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
+        history.append(
+            {
+                "epoch": float(epoch + 1),
+                "train_loss": train_loss,
+                "val_loss": float(val_loss),
+                "best_val_loss_so_far": float(min(best_loss, val_loss)),
+            }
+        )
         if val_loss < best_loss:
             best_loss = val_loss
             best_state = deepcopy(model.state_dict())
+            best_epoch = epoch + 1
             wait = 0
         else:
             wait += 1
             if wait >= patience:
                 break
     model.load_state_dict(best_state)
+    _attach_training_artifacts(model, history, best_epoch, best_loss, time.perf_counter() - start_time)
     return model
 
 
@@ -189,14 +232,18 @@ def train_safe_tcn(
     harm_margin: float = 0.0,
     patience: int = 4,
 ) -> SafeTCNForecaster:
+    start_time = time.perf_counter()
     model = model.to(device)
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
     best_loss = float("inf")
     best_state = deepcopy(model.state_dict())
+    best_epoch = 0
     wait = 0
-    for _ in range(epochs):
+    history: list[dict[str, float]] = []
+    for epoch in range(epochs):
         model.train()
+        train_losses = []
         for x_feat, x_tgt, y in train_loader:
             y_batch = y.to(device)
             out = model(
@@ -255,16 +302,28 @@ def train_safe_tcn(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
+            train_losses.append(float(loss.item()))
         val_loss = evaluate_safe_tcn(model, val_loader, target_profile, source_profiles, relation_features, device)
+        train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
+        history.append(
+            {
+                "epoch": float(epoch + 1),
+                "train_loss": train_loss,
+                "val_loss": float(val_loss),
+                "best_val_loss_so_far": float(min(best_loss, val_loss)),
+            }
+        )
         if val_loss < best_loss:
             best_loss = val_loss
             best_state = deepcopy(model.state_dict())
+            best_epoch = epoch + 1
             wait = 0
         else:
             wait += 1
             if wait >= patience:
                 break
     model.load_state_dict(best_state)
+    _attach_training_artifacts(model, history, best_epoch, best_loss, time.perf_counter() - start_time)
     return model
 
 
@@ -338,6 +397,58 @@ def collect_safe_components(
         np.concatenate(target_preds, axis=0),
         np.concatenate(transfer_terms, axis=0),
     )
+
+
+def collect_safe_outputs(
+    model: SafeTCNForecaster,
+    loader: DataLoader,
+    target_profile: torch.Tensor,
+    source_profiles: torch.Tensor,
+    relation_features: torch.Tensor,
+    device: torch.device,
+) -> dict[str, np.ndarray]:
+    model.eval()
+    rows: dict[str, list[np.ndarray]] = {
+        "truths": [],
+        "final": [],
+        "target": [],
+        "transfer_strength": [],
+        "raw_transfer": [],
+        "bounded_transfer": [],
+        "calibrated_transfer": [],
+        "residual_budget": [],
+        "source_preds": [],
+        "source_weights": [],
+        "source_gates": [],
+    }
+    with torch.no_grad():
+        for x_feat, x_tgt, y in loader:
+            out = model(
+                x_feat.to(device),
+                x_tgt.to(device),
+                target_profile.to(device),
+                source_profiles.to(device),
+                relation_features.to(device),
+            )
+            rows["truths"].append(y.numpy())
+            rows["final"].append(out["final"].cpu().numpy())
+            rows["target"].append(out["target"].cpu().numpy())
+            rows["transfer_strength"].append(out["transfer_strength"].cpu().numpy())
+            rows["raw_transfer"].append(out["raw_transfer"].cpu().numpy())
+            rows["bounded_transfer"].append(out["bounded_transfer"].cpu().numpy())
+            rows["calibrated_transfer"].append(out["calibrated_transfer"].cpu().numpy())
+            rows["residual_budget"].append(out["residual_budget"].cpu().numpy())
+            rows["source_preds"].append(out["sources"].cpu().numpy())
+            rows["source_weights"].append(out["weights"].cpu().numpy())
+            rows["source_gates"].append(out["source_gates"].cpu().numpy())
+    result: dict[str, np.ndarray] = {}
+    for key, parts in rows.items():
+        if not parts:
+            result[key] = np.zeros((0,), dtype=np.float32)
+            continue
+        result[key] = np.concatenate(parts, axis=0)
+    result["calibration_alpha"] = model.calibration_alpha.detach().cpu().numpy().copy()
+    return result
 
 
 def calibrate_safe_tcn(

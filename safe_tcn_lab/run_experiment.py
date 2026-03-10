@@ -9,11 +9,20 @@ from datetime import datetime
 from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from safe_tcn_lab.artifacts import (
+    build_per_target_metrics_frame,
+    build_prediction_frame,
+    build_safe_source_frame,
+    build_source_selection_frame,
+    build_training_history_frame,
+    save_parquet,
+)
 from safe_tcn_lab.baselines import (
     build_persistence_predictions,
     build_tabular_matrix,
@@ -27,7 +36,7 @@ from safe_tcn_lab.models import SafeTCNForecaster, TaskConditionedTCN
 from safe_tcn_lab.train import (
     calibrate_safe_tcn,
     collect_local_predictions,
-    collect_safe_predictions,
+    collect_safe_outputs,
     set_seed,
     train_local_model,
     train_multitask_pretrain,
@@ -70,6 +79,20 @@ def save_json(payload: Dict, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, default=float)
+
+
+def denormalize_with_stats(data: MultiTaskForecastData, task_id: int, values: np.ndarray, normalization_train_days: int | None = None) -> np.ndarray:
+    stats = data.get_normalization_stats(task_id, train_days_limit=normalization_train_days)
+    return data.denormalize_target(task_id, values, stats=stats)
+
+
+def target_std_with_stats(data: MultiTaskForecastData, task_id: int, normalization_train_days: int | None = None) -> float:
+    _, std = data.get_normalization_stats(task_id, train_days_limit=normalization_train_days)
+    return float(std[-1])
+
+
+def artifact_path(run_dir: str, *parts: str) -> str:
+    return os.path.join(run_dir, "artifacts", *parts)
 
 
 def get_device(device_name: str | None) -> torch.device:
@@ -125,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ridge_alpha", type=float, default=1.0)
     parser.add_argument("--lgbm_estimators", type=int, default=120)
     parser.add_argument("--output_root", default="safe_tcn_lab/outputs")
+    parser.add_argument("--disable_artifacts", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -187,6 +211,43 @@ def evaluate_task_predictions(
     return metrics
 
 
+def save_prediction_artifact(
+    run_dir: str,
+    data: MultiTaskForecastData,
+    task_id: int,
+    dataset,
+    seed: int,
+    method: str,
+    split: str,
+    y_true_norm: np.ndarray,
+    y_pred_norm: np.ndarray,
+    normalization_train_days: int | None = None,
+    extras: Dict[str, np.ndarray] | None = None,
+) -> None:
+    y_true = denormalize_with_stats(data, task_id, y_true_norm, normalization_train_days)
+    y_pred = denormalize_with_stats(data, task_id, y_pred_norm, normalization_train_days)
+    frame = build_prediction_frame(
+        spec=data.spec,
+        dataset=dataset,
+        dataset_name=data.spec.name,
+        seed=seed,
+        target_id=task_id,
+        method=method,
+        split=split,
+        y_true=y_true,
+        y_pred=y_pred,
+        extras=extras,
+    )
+    save_parquet(frame, artifact_path(run_dir, "predictions", method, f"target_{task_id}_{split}.parquet"))
+
+
+def save_training_history_artifact(run_dir: str, dataset_name: str, seed: int, target_id: int, method: str, model) -> None:
+    frame = build_training_history_frame(dataset_name, seed, target_id, method, model)
+    if frame.empty:
+        return
+    save_parquet(frame, artifact_path(run_dir, "training_history", method, f"target_{target_id}.parquet"))
+
+
 def drop_hidden(metrics: Dict[str, float]) -> Dict[str, float]:
     return {key: value for key, value in metrics.items() if not key.startswith("_")}
 
@@ -224,6 +285,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
     per_target: Dict[int, Dict[str, Dict[str, float]]] = {}
     run_dir = os.path.join(args.output_root, f"{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(run_dir, exist_ok=True)
+    save_json(vars(args), os.path.join(run_dir, "config.json"))
+    source_selection_frames: list[pd.DataFrame] = []
 
     for target_id in args.target_ids:
         print(f"\n=== Target {target_id} ===")
@@ -236,6 +299,16 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         )
         source_ids = [task_id for task_id, _ in source_pairs]
         target_results["_sources"] = [{"task_id": task_id, "similarity": similarity} for task_id, similarity in source_pairs]
+        if not args.disable_artifacts:
+            source_selection_frames.append(
+                build_source_selection_frame(
+                    dataset_name=args.dataset,
+                    seed=args.seed,
+                    target_id=target_id,
+                    target_train_days=args.target_train_days,
+                    source_pairs=source_pairs,
+                )
+            )
 
         target_train = data.get_dataset(
             target_id,
@@ -273,6 +346,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
             target_train_days_limit=args.target_train_days,
         )
         relation_np = relation_np if relation_np.size else np.zeros((0, 8), dtype=np.float32)
+        target_std = target_std_with_stats(data, target_id, normalization_train_days=args.target_train_days)
 
         y_true_test = np.stack([target_test[idx][2].numpy() for idx in range(len(target_test))], axis=0)
         x_train_local, y_train_local = build_tabular_matrix(target_train)
@@ -280,6 +354,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         local_model = None
 
         if "persistence" in args.methods:
+            print(f"Target {target_id} | persistence")
             y_true, y_pred = build_persistence_predictions(target_test)
             target_results["persistence"] = evaluate_task_predictions(
                 data,
@@ -289,8 +364,22 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
+            if not args.disable_artifacts:
+                save_prediction_artifact(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    "persistence",
+                    "test",
+                    y_true,
+                    y_pred,
+                    normalization_train_days=args.target_train_days,
+                )
 
         if "ridge_local" in args.methods:
+            print(f"Target {target_id} | ridge_local")
             ridge_local = fit_ridge_multioutput(x_train_local, y_train_local, alpha=args.ridge_alpha)
             y_pred = ridge_local.predict(x_test).astype(np.float32)
             target_results["ridge_local"] = evaluate_task_predictions(
@@ -301,8 +390,22 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
+            if not args.disable_artifacts:
+                save_prediction_artifact(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    "ridge_local",
+                    "test",
+                    y_true_test,
+                    y_pred,
+                    normalization_train_days=args.target_train_days,
+                )
 
         if "lgbm_local" in args.methods:
+            print(f"Target {target_id} | lgbm_local")
             lgbm_local = fit_lgbm_multioutput(
                 x_train_local,
                 y_train_local,
@@ -318,8 +421,22 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
+            if not args.disable_artifacts:
+                save_prediction_artifact(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    "lgbm_local",
+                    "test",
+                    y_true_test,
+                    y_pred,
+                    normalization_train_days=args.target_train_days,
+                )
 
         if "lgbm_transfer" in args.methods and source_ids:
+            print(f"Target {target_id} | lgbm_transfer")
             x_parts = [x_train_local]
             y_parts = [y_train_local]
             for source_id in source_ids:
@@ -344,8 +461,22 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
+            if not args.disable_artifacts:
+                save_prediction_artifact(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    "lgbm_transfer",
+                    "test",
+                    y_true_test,
+                    y_pred,
+                    normalization_train_days=args.target_train_days,
+                )
 
         if any(method in args.methods for method in ("tcn_local", "safe_tcn")):
+            print(f"Target {target_id} | tcn_local train")
             local_model = train_local_model(
                 make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim),
                 train_loader,
@@ -367,8 +498,23 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
+            if not args.disable_artifacts:
+                save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "tcn_local", local_model)
+                save_prediction_artifact(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    "tcn_local",
+                    "test",
+                    y_true,
+                    y_pred,
+                    normalization_train_days=args.target_train_days,
+                )
 
         if any(method in args.methods for method in ("fine_tune", "safe_tcn")) and source_ids:
+            print(f"Target {target_id} | multitask_pretrain")
             pretrain_train = data.make_multitask_dataset(source_ids, "train", stride=args.train_stride)
             pretrain_val = data.make_multitask_dataset(source_ids, "val", stride=args.eval_stride)
             pretrain_model = train_multitask_pretrain(
@@ -382,8 +528,11 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 weight_decay=args.weight_decay,
                 patience=args.patience,
             )
+            if not args.disable_artifacts:
+                save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "multitask_pretrain", pretrain_model)
 
             if "fine_tune" in args.methods:
+                print(f"Target {target_id} | fine_tune")
                 fine_tune_model = make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim)
                 fine_tune_model.load_state_dict(pretrain_model.state_dict())
                 fine_tune_model = train_local_model(
@@ -407,8 +556,23 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     y_pred,
                     normalization_train_days=args.target_train_days,
                 )
+                if not args.disable_artifacts:
+                    save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "fine_tune", fine_tune_model)
+                    save_prediction_artifact(
+                        run_dir,
+                        data,
+                        target_id,
+                        target_test,
+                        args.seed,
+                        "fine_tune",
+                        "test",
+                        y_true,
+                        y_pred,
+                        normalization_train_days=args.target_train_days,
+                    )
 
             if "safe_tcn" in args.methods:
+                print(f"Target {target_id} | safe_tcn")
                 if local_model is None:
                     raise RuntimeError("safe_tcn requires a trained local backbone.")
                 safe_target_model = make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim)
@@ -451,7 +615,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     harm_limit=args.calibration_harm_limit,
                     grid_size=args.calibration_grid_size,
                 )
-                y_true, y_pred = collect_safe_predictions(
+                safe_outputs = collect_safe_outputs(
                     safe_model,
                     test_loader,
                     target_profile=torch.from_numpy(target_profile_np),
@@ -459,6 +623,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     relation_features=torch.from_numpy(relation_np),
                     device=device,
                 )
+                y_true = safe_outputs["truths"]
+                y_pred = safe_outputs["final"]
                 target_results["safe_tcn"] = evaluate_task_predictions(
                     data,
                     target_id,
@@ -467,6 +633,55 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     y_pred,
                     normalization_train_days=args.target_train_days,
                 )
+                if not args.disable_artifacts:
+                    target_pred_denorm = denormalize_with_stats(data, target_id, safe_outputs["target"], normalization_train_days=args.target_train_days)
+                    final_pred_denorm = denormalize_with_stats(data, target_id, safe_outputs["final"], normalization_train_days=args.target_train_days)
+                    source_pred_denorm = denormalize_with_stats(
+                        data,
+                        target_id,
+                        safe_outputs["source_preds"],
+                        normalization_train_days=args.target_train_days,
+                    )
+                    prediction_extras = {
+                        "y_local": target_pred_denorm,
+                        "transfer_strength": safe_outputs["transfer_strength"],
+                        "raw_transfer": safe_outputs["raw_transfer"] * target_std,
+                        "bounded_transfer": safe_outputs["bounded_transfer"] * target_std,
+                        "transfer_delta": final_pred_denorm - target_pred_denorm,
+                        "residual_budget": safe_outputs["residual_budget"] * target_std,
+                        "calibration_alpha": safe_outputs["calibration_alpha"],
+                    }
+                    save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "safe_tcn", safe_model)
+                    save_prediction_artifact(
+                        run_dir,
+                        data,
+                        target_id,
+                        target_test,
+                        args.seed,
+                        "safe_tcn",
+                        "test",
+                        y_true,
+                        y_pred,
+                        normalization_train_days=args.target_train_days,
+                        extras=prediction_extras,
+                    )
+                    safe_source_frame = build_safe_source_frame(
+                        spec=data.spec,
+                        dataset=target_test,
+                        dataset_name=args.dataset,
+                        seed=args.seed,
+                        target_id=target_id,
+                        split="test",
+                        source_ids=source_ids,
+                        source_preds=source_pred_denorm,
+                        source_weights=safe_outputs["source_weights"],
+                        source_gates=safe_outputs["source_gates"],
+                    )
+                    if not safe_source_frame.empty:
+                        save_parquet(
+                            safe_source_frame,
+                            artifact_path(run_dir, "safe_sources", "safe_tcn", f"target_{target_id}_test.parquet"),
+                        )
 
         add_transfer_safety(target_results, baseline_method="tcn_local")
         per_target[target_id] = target_results
@@ -481,6 +696,13 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         "summary": summary,
     }
     save_json(payload, os.path.join(run_dir, "report.json"))
+    if not args.disable_artifacts:
+        metrics_frame = build_per_target_metrics_frame(args.dataset, args.seed, per_target)
+        if not metrics_frame.empty:
+            save_parquet(metrics_frame, artifact_path(run_dir, "per_target_metrics.parquet"))
+        if source_selection_frames:
+            source_selection = pd.concat(source_selection_frames, ignore_index=True)
+            save_parquet(source_selection, artifact_path(run_dir, "source_selection.parquet"))
 
     print("\nSummary")
     for method, metrics in summary.items():
