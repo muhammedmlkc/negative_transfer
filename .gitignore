@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Local OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Data artifacts
+data/processed/*
+!data/processed/.gitkeep
+
+# Internal notes
+docs/CLAUDE_PROMPT.md
+docs/CORRECTED_VERDICT.md
+docs/NEXT_STEPS.md
+docs/PUBLISHABLE_DIRECTION.md
+
+# Experiment outputs
+safe_tcn_lab/outputs/
+safe_tcn_lab/benchmark_outputs/
+safe_tcn_lab/transfer_sweeps/
+safe_tcn_lab/transfer_sweeps_main/
+
+# Notebook / misc artifacts
+*.ipynb_checkpoints
