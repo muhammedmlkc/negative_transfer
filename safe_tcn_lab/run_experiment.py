@@ -198,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--residual_cap_floor", type=float, default=0.02)
     parser.add_argument("--calibration_harm_limit", type=float, default=0.45)
     parser.add_argument("--calibration_grid_size", type=int, default=11)
+    parser.add_argument("--safe_patch_regime_bins", type=int, default=3)
+    parser.add_argument("--safe_patch_horizon_blocks", type=int, default=3)
+    parser.add_argument("--safe_patch_min_bin_samples", type=int, default=64)
+    parser.add_argument("--safe_patch_tail_penalty", type=float, default=0.35)
+    parser.add_argument("--safe_patch_agreement_temperature", type=float, default=1.0)
     parser.add_argument("--ridge_alpha", type=float, default=1.0)
     parser.add_argument("--lgbm_estimators", type=int, default=120)
     parser.add_argument("--nf_max_steps", type=int, default=300)
@@ -823,6 +828,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 "transfer_delta": safe_patch_outputs["transfer_delta"],
                 "residual_budget": safe_patch_outputs["residual_budget"],
                 "calibration_alpha": safe_patch_outputs["calibration_alpha"],
+                "regime_score": safe_patch_outputs["regime_score"],
+                "regime_bin": safe_patch_outputs["regime_bin"],
+                "horizon_block": safe_patch_outputs["horizon_block"],
+                "source_dispersion": safe_patch_outputs["source_dispersion"],
             }
             finalize_method(
                 "safe_patchtst",
