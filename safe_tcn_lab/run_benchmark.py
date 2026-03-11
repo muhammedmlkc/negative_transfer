@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -106,7 +107,7 @@ def aggregate_runs(runs: List[Dict], baseline_method: str, primary_method: str) 
 def build_benchmark_parser() -> argparse.ArgumentParser:
     parser = build_parser()
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
-    parser.add_argument("--baseline_method", default="tcn_local")
+    parser.add_argument("--baseline_method", default="tcn")
     parser.add_argument("--primary_method", default="safe_tcn")
     parser.add_argument("--benchmark_root", default="safe_tcn_lab/benchmark_outputs")
     return parser
@@ -124,6 +125,19 @@ def main() -> None:
         runs.append(run_experiment(SimpleNamespace(**run_args)))
     summary = aggregate_runs(runs, baseline_method=args.baseline_method, primary_method=args.primary_method)
     save_json({"config": vars(args), "runs": runs, "summary": summary}, os.path.join(run_root, "benchmark_report.json"))
+    pd.DataFrame(summary["records"]).to_parquet(os.path.join(run_root, "benchmark_records.parquet"), index=False)
+    pd.DataFrame(
+        [
+            {"method": method, **metrics}
+            for method, metrics in summary["aggregate"].items()
+        ]
+    ).to_parquet(os.path.join(run_root, "benchmark_aggregate.parquet"), index=False)
+    pd.DataFrame(
+        [
+            {"comparator": method, **metrics}
+            for method, metrics in summary["significance_vs_primary"].items()
+        ]
+    ).to_parquet(os.path.join(run_root, "benchmark_significance.parquet"), index=False)
 
     print("\nBenchmark Summary")
     for method, metrics in summary["aggregate"].items():

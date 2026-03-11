@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from safe_tcn_lab.data import DatasetSpec, WindowDataset
+from safe_tcn_lab.metrics import sdwpf_valid_mask
 
 
 def save_parquet(frame: pd.DataFrame, path: str) -> None:
@@ -32,6 +33,7 @@ def build_prediction_frame(
         future = dataset.get_future_frame(window_id)
         timestamps = pd.to_datetime(future[spec.time_col]).reset_index(drop=True)
         forecast_start = timestamps.iloc[0] if len(timestamps) else pd.NaT
+        valid_mask = sdwpf_valid_mask(future) if dataset_name == "sdwpf" else np.ones(len(future), dtype=bool)
         for horizon in range(len(timestamps)):
             row = {
                 "dataset": dataset_name,
@@ -45,7 +47,12 @@ def build_prediction_frame(
                 "horizon": horizon + 1,
                 "y_true": float(y_true[window_id, horizon]),
                 "y_pred": float(y_pred[window_id, horizon]),
+                "is_valid_point": bool(valid_mask[horizon]),
             }
+            for col in spec.feature_cols:
+                if col in future.columns:
+                    value = future.iloc[horizon][col]
+                    row[col] = float(value) if pd.notna(value) else np.nan
             for key, value in extras.items():
                 arr = np.asarray(value)
                 if arr.ndim == 1:
@@ -158,6 +165,44 @@ def build_per_target_metrics_frame(dataset_name: str, seed: int, per_target: Dic
     return pd.DataFrame(rows)
 
 
+def build_window_metric_frame(
+    spec: DatasetSpec,
+    dataset: WindowDataset,
+    dataset_name: str,
+    seed: int,
+    target_id: int,
+    method: str,
+    split: str,
+    window_mae: Sequence[float],
+    window_rmse: Sequence[float],
+) -> pd.DataFrame:
+    rows = []
+    window_mae = np.asarray(window_mae, dtype=np.float64)
+    window_rmse = np.asarray(window_rmse, dtype=np.float64)
+    count = min(len(dataset), len(window_mae), len(window_rmse))
+    for window_id in range(count):
+        future = dataset.get_future_frame(window_id)
+        timestamps = pd.to_datetime(future[spec.time_col]).reset_index(drop=True)
+        forecast_start = timestamps.iloc[0] if len(timestamps) else pd.NaT
+        valid_mask = sdwpf_valid_mask(future) if dataset_name == "sdwpf" else np.ones(len(future), dtype=bool)
+        rows.append(
+            {
+                "dataset": dataset_name,
+                "seed": seed,
+                "target_id": target_id,
+                "method": method,
+                "split": split,
+                "window_id": window_id,
+                "forecast_start_time": forecast_start,
+                "window_mae": float(window_mae[window_id]),
+                "window_rmse": float(window_rmse[window_id]),
+                "valid_points": int(valid_mask.sum()),
+                "window_points": int(len(valid_mask)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def build_training_history_frame(dataset_name: str, seed: int, target_id: int, method: str, model) -> pd.DataFrame:
     history = getattr(model, "_training_history", None) or []
     summary = getattr(model, "_training_summary", None) or {}
@@ -174,5 +219,17 @@ def build_training_history_frame(dataset_name: str, seed: int, target_id: int, m
         row["best_val_loss"] = summary.get("best_val_loss")
         row["duration_sec"] = summary.get("duration_sec")
         row["epochs_ran"] = summary.get("epochs_ran")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_runtime_frame(dataset_name: str, seed: int, runtime_rows: Sequence[dict[str, object]]) -> pd.DataFrame:
+    rows = []
+    for item in runtime_rows:
+        row = {
+            "dataset": dataset_name,
+            "seed": seed,
+        }
+        row.update(item)
         rows.append(row)
     return pd.DataFrame(rows)

@@ -17,10 +17,10 @@ This repo expects the following files to be placed locally and does not commit t
 
 ## Quick start
 
-Use a PyTorch-ready environment, then install the non-PyTorch dependencies:
+Use a PyTorch-ready environment, then install the project dependencies:
 
 ```bash
-bash scripts/runpod_setup.sh
+pip install -r requirements.txt
 ```
 
 Smoke test:
@@ -29,6 +29,8 @@ Smoke test:
 python safe_tcn_lab/smoke_test.py
 ```
 
-RunPod instructions:
+Full paper-ready comparator preset:
 
-- `docs/RUNPOD.md`
+```bash
+python safe_tcn_lab/run_experiment.py --dataset gefcom --methods paper_all
+```

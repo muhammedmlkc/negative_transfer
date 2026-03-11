@@ -100,6 +100,63 @@ def train_multitask_pretrain(
     return model
 
 
+def train_multitask_target_model(
+    model: TaskConditionedTCN,
+    train_loader: DataLoader,
+    target_val_loader: DataLoader,
+    profile_bank: torch.Tensor,
+    target_profile: torch.Tensor,
+    device: torch.device,
+    epochs: int = 20,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-5,
+    patience: int = 4,
+) -> TaskConditionedTCN:
+    start_time = time.perf_counter()
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.MSELoss()
+    best_loss = float("inf")
+    best_state = deepcopy(model.state_dict())
+    best_epoch = 0
+    wait = 0
+    history: list[dict[str, float]] = []
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+        for x_feat, x_tgt, y, task_idx in train_loader:
+            profiles = profile_bank[task_idx.to(device)]
+            pred = model(x_feat.to(device), x_tgt.to(device), profiles)
+            loss = criterion(pred, y.to(device))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(float(loss.item()))
+        val_loss = _evaluate_local(model, target_val_loader, target_profile, device)
+        train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
+        history.append(
+            {
+                "epoch": float(epoch + 1),
+                "train_loss": train_loss,
+                "val_loss": float(val_loss),
+                "best_val_loss_so_far": float(min(best_loss, val_loss)),
+            }
+        )
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_state = deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+    model.load_state_dict(best_state)
+    _attach_training_artifacts(model, history, best_epoch, best_loss, time.perf_counter() - start_time)
+    return model
+
+
 def _evaluate_local(model: TaskConditionedTCN, loader: DataLoader, profile: torch.Tensor, device: torch.device) -> float:
     model.eval()
     criterion = nn.MSELoss()

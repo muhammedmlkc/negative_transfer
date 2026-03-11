@@ -8,6 +8,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Dict, List
 
+import pandas as pd
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from safe_tcn_lab.run_benchmark import aggregate_runs, build_benchmark_parser
@@ -50,6 +52,13 @@ def main() -> None:
             {"config": vars(args), "target_train_days": target_days, "runs": runs, "summary": summary},
             os.path.join(day_root, "benchmark_report.json"),
         )
+        pd.DataFrame(summary["records"]).to_parquet(os.path.join(day_root, "benchmark_records.parquet"), index=False)
+        pd.DataFrame(
+            [
+                {"method": method, **metrics}
+                for method, metrics in summary["aggregate"].items()
+            ]
+        ).to_parquet(os.path.join(day_root, "benchmark_aggregate.parquet"), index=False)
 
         primary = summary["aggregate"].get(args.primary_method, {})
         baseline = summary["aggregate"].get(args.baseline_method, {})
@@ -64,6 +73,14 @@ def main() -> None:
         {"config": vars(args), "results_by_target_days": all_days},
         os.path.join(sweep_root, "transfer_sweep_report.json"),
     )
+    sweep_rows = []
+    for target_days, payload in all_days.items():
+        for method, metrics in payload["summary"]["aggregate"].items():
+            row = {"target_train_days": int(target_days), "method": method}
+            row.update(metrics)
+            sweep_rows.append(row)
+    if sweep_rows:
+        pd.DataFrame(sweep_rows).to_parquet(os.path.join(sweep_root, "transfer_sweep_aggregate.parquet"), index=False)
 
 
 if __name__ == "__main__":

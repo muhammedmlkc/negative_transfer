@@ -94,7 +94,7 @@ def evaluate_predictions(
     return evaluate_generic(y_true, y_pred, rated_capacity=rated_capacity)
 
 
-def add_transfer_safety(per_target: Dict[str, Dict[str, float]], baseline_method: str = "tcn_local") -> None:
+def add_transfer_safety(per_target: Dict[str, Dict[str, float]], baseline_method: str = "tcn") -> None:
     if baseline_method not in per_target:
         return
     baseline = per_target[baseline_method]
@@ -148,7 +148,7 @@ def summarize_results(all_results: Dict[int, Dict[str, Dict[str, float]]]) -> Di
             values = [row.get(metric, math.nan) for row in rows]
             finite = [value for value in values if np.isfinite(value)]
             summary[method][metric] = float(np.mean(finite)) if finite else float("nan")
-        if method != "tcn_local":
+        if method != "tcn":
             neg_rmse = [row.get("NEG_TRANSFER_RMSE", math.nan) for row in rows]
             neg_mae = [row.get("NEG_TRANSFER_MAE", math.nan) for row in rows]
             neg_rmse = [value for value in neg_rmse if np.isfinite(value)]

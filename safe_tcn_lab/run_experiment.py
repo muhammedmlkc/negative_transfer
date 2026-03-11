@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import time
 from datetime import datetime
 from typing import Dict, List
 
@@ -18,9 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from safe_tcn_lab.artifacts import (
     build_per_target_metrics_frame,
     build_prediction_frame,
+    build_runtime_frame,
     build_safe_source_frame,
     build_source_selection_frame,
     build_training_history_frame,
+    build_window_metric_frame,
     save_parquet,
 )
 from safe_tcn_lab.baselines import (
@@ -33,6 +36,7 @@ from safe_tcn_lab.baselines import (
 from safe_tcn_lab.data import MultiTaskForecastData, get_dataset_spec
 from safe_tcn_lab.metrics import add_transfer_safety, evaluate_predictions, summarize_results
 from safe_tcn_lab.models import SafeTCNForecaster, TaskConditionedTCN
+from safe_tcn_lab.nf_baselines import NF_METHODS, fit_nf_model, predict_nf_windows
 from safe_tcn_lab.train import (
     calibrate_safe_tcn,
     collect_local_predictions,
@@ -40,6 +44,7 @@ from safe_tcn_lab.train import (
     set_seed,
     train_local_model,
     train_multitask_pretrain,
+    train_multitask_target_model,
     train_safe_tcn,
 )
 
@@ -66,13 +71,44 @@ DATASET_DEFAULTS = {
 
 CORE_METHODS = [
     "persistence",
-    "ridge_local",
-    "lgbm_local",
-    "lgbm_transfer",
-    "tcn_local",
-    "fine_tune",
+    "ridge",
+    "lightgbm",
+    "tcn",
+    "tcn_fine_tune",
     "safe_tcn",
 ]
+
+PAPER_METHODS = [
+    "persistence",
+    "ridge",
+    "lightgbm",
+    "lstm",
+    "gru",
+    "tcn",
+    "dlinear",
+    "nbeats",
+    "informer",
+    "fedformer",
+    "patchtst",
+    "timesnet",
+    "itransformer",
+    "tcn_fine_tune",
+    "tcn_multi_task",
+    "safe_tcn",
+]
+
+EXTRA_METHODS = ["lgbm_transfer"]
+
+ALL_METHODS = list(dict.fromkeys(CORE_METHODS + list(NF_METHODS) + PAPER_METHODS + EXTRA_METHODS))
+
+METHOD_ALIASES = {
+    "ridge_local": "ridge",
+    "lgbm_local": "lightgbm",
+    "lgbm": "lightgbm",
+    "tcn_local": "tcn",
+    "fine_tune": "tcn_fine_tune",
+    "multi_task": "tcn_multi_task",
+}
 
 
 def save_json(payload: Dict, path: str) -> None:
@@ -147,6 +183,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration_grid_size", type=int, default=11)
     parser.add_argument("--ridge_alpha", type=float, default=1.0)
     parser.add_argument("--lgbm_estimators", type=int, default=120)
+    parser.add_argument("--nf_max_steps", type=int, default=300)
+    parser.add_argument("--nf_learning_rate", type=float, default=1e-3)
+    parser.add_argument("--nf_early_stop_patience_steps", type=int, default=30)
+    parser.add_argument("--nf_val_check_steps", type=int, default=20)
+    parser.add_argument("--nf_batch_size", type=int, default=32)
+    parser.add_argument("--nf_windows_batch_size", type=int, default=128)
+    parser.add_argument("--nf_inference_windows_batch_size", type=int, default=256)
+    parser.add_argument("--nf_hidden_size", type=int, default=128)
+    parser.add_argument("--nf_num_layers", type=int, default=2)
+    parser.add_argument("--nf_dropout", type=float, default=0.1)
+    parser.add_argument("--nf_n_heads", type=int, default=4)
+    parser.add_argument("--nf_patch_len", type=int, default=16)
     parser.add_argument("--output_root", default="safe_tcn_lab/outputs")
     parser.add_argument("--disable_artifacts", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -158,10 +206,17 @@ def resolve_methods(methods: List[str] | None) -> List[str]:
         return list(CORE_METHODS)
     expanded: List[str] = []
     for method in methods:
-        if method == "core":
+        normalized = METHOD_ALIASES.get(method.lower(), method.lower())
+        if normalized == "core":
             expanded.extend(CORE_METHODS)
+        elif normalized == "paper_all":
+            expanded.extend(PAPER_METHODS)
+        elif normalized == "extended_all":
+            expanded.extend(PAPER_METHODS + EXTRA_METHODS)
         else:
-            expanded.append(method)
+            if normalized not in ALL_METHODS:
+                raise ValueError(f"Unknown method '{method}'. Available methods: {', '.join(ALL_METHODS)}")
+            expanded.append(normalized)
     seen = set()
     ordered = []
     for method in expanded:
@@ -211,6 +266,25 @@ def evaluate_task_predictions(
     return metrics
 
 
+def evaluate_task_predictions_raw(
+    data: MultiTaskForecastData,
+    dataset,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> Dict[str, float]:
+    future_frames = [dataset.get_future_frame(idx) for idx in range(len(dataset))]
+    metrics, window_mae, window_rmse = evaluate_predictions(
+        dataset_name=data.spec.name,
+        y_true=y_true,
+        y_pred=y_pred,
+        future_frames=future_frames,
+        rated_capacity=data.spec.rated_capacity,
+    )
+    metrics["_WINDOW_MAE"] = window_mae.tolist()
+    metrics["_WINDOW_RMSE"] = window_rmse.tolist()
+    return metrics
+
+
 def save_prediction_artifact(
     run_dir: str,
     data: MultiTaskForecastData,
@@ -241,6 +315,62 @@ def save_prediction_artifact(
     save_parquet(frame, artifact_path(run_dir, "predictions", method, f"target_{task_id}_{split}.parquet"))
 
 
+def save_prediction_artifact_raw(
+    run_dir: str,
+    data: MultiTaskForecastData,
+    task_id: int,
+    dataset,
+    seed: int,
+    method: str,
+    split: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    extras: Dict[str, np.ndarray] | None = None,
+) -> None:
+    frame = build_prediction_frame(
+        spec=data.spec,
+        dataset=dataset,
+        dataset_name=data.spec.name,
+        seed=seed,
+        target_id=task_id,
+        method=method,
+        split=split,
+        y_true=y_true,
+        y_pred=y_pred,
+        extras=extras,
+    )
+    save_parquet(frame, artifact_path(run_dir, "predictions", method, f"target_{task_id}_{split}.parquet"))
+
+
+def save_window_metrics_artifact(
+    run_dir: str,
+    data: MultiTaskForecastData,
+    task_id: int,
+    dataset,
+    seed: int,
+    method: str,
+    split: str,
+    metrics: Dict[str, float],
+) -> None:
+    window_mae = metrics.get("_WINDOW_MAE")
+    window_rmse = metrics.get("_WINDOW_RMSE")
+    if window_mae is None or window_rmse is None:
+        return
+    frame = build_window_metric_frame(
+        spec=data.spec,
+        dataset=dataset,
+        dataset_name=data.spec.name,
+        seed=seed,
+        target_id=task_id,
+        method=method,
+        split=split,
+        window_mae=window_mae,
+        window_rmse=window_rmse,
+    )
+    if not frame.empty:
+        save_parquet(frame, artifact_path(run_dir, "window_metrics", method, f"target_{task_id}_{split}.parquet"))
+
+
 def save_training_history_artifact(run_dir: str, dataset_name: str, seed: int, target_id: int, method: str, model) -> None:
     frame = build_training_history_frame(dataset_name, seed, target_id, method, model)
     if frame.empty:
@@ -252,6 +382,23 @@ def drop_hidden(metrics: Dict[str, float]) -> Dict[str, float]:
     return {key: value for key, value in metrics.items() if not key.startswith("_")}
 
 
+def record_runtime(
+    runtime_rows: list[dict[str, object]],
+    target_id: int,
+    method: str,
+    stage: str,
+    duration_sec: float,
+    device: torch.device,
+) -> None:
+    runtime_rows.append(
+        {
+            "target_id": int(target_id),
+            "method": method,
+            "stage": stage,
+            "duration_sec": float(duration_sec),
+            "device": str(device),
+        }
+    )
 def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
     defaults = DATASET_DEFAULTS[args.dataset]
     args.parquet_path = args.parquet_path or defaults["parquet_path"]
@@ -261,12 +408,15 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
     args.max_sources = args.max_sources if args.max_sources is not None else defaults["max_sources"]
     args.min_similarity = args.min_similarity if args.min_similarity is not None else defaults["min_similarity"]
     args.methods = resolve_methods(args.methods)
+    args.nf_val_check_steps = min(args.nf_val_check_steps, args.nf_max_steps)
 
     if args.smoke:
         args.target_ids = args.target_ids[:1]
         args.pretrain_epochs = min(args.pretrain_epochs, 2)
         args.finetune_epochs = min(args.finetune_epochs, 2)
         args.safe_epochs = min(args.safe_epochs, 2)
+        args.nf_max_steps = min(args.nf_max_steps, 2)
+        args.nf_val_check_steps = min(args.nf_val_check_steps, args.nf_max_steps)
         args.train_stride = max(args.train_stride, 24)
         args.eval_stride = max(args.eval_stride, 24)
 
@@ -281,12 +431,14 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         n_pc_bins=args.n_pc_bins,
         max_rows_per_task=args.max_rows_per_task,
     ).load()
+    profile_bank_tensor = torch.from_numpy(data.get_profiles(data.task_ids))
 
     per_target: Dict[int, Dict[str, Dict[str, float]]] = {}
     run_dir = os.path.join(args.output_root, f"{args.dataset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(run_dir, exist_ok=True)
     save_json(vars(args), os.path.join(run_dir, "config.json"))
     source_selection_frames: list[pd.DataFrame] = []
+    runtime_rows: list[dict[str, object]] = []
 
     for target_id in args.target_ids:
         print(f"\n=== Target {target_id} ===")
@@ -349,14 +501,67 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         target_std = target_std_with_stats(data, target_id, normalization_train_days=args.target_train_days)
 
         y_true_test = np.stack([target_test[idx][2].numpy() for idx in range(len(target_test))], axis=0)
+        y_true_test_raw = denormalize_with_stats(
+            data,
+            target_id,
+            y_true_test,
+            normalization_train_days=args.target_train_days,
+        )
         x_train_local, y_train_local = build_tabular_matrix(target_train)
         x_test, _ = build_tabular_matrix(target_test)
         local_model = None
+        pretrain_model = None
+
+        def finalize_method(
+            method_name: str,
+            metrics: Dict[str, float],
+            *,
+            normalized_outputs: tuple[np.ndarray, np.ndarray] | None = None,
+            raw_outputs: tuple[np.ndarray, np.ndarray] | None = None,
+            extras: Dict[str, np.ndarray] | None = None,
+            model=None,
+        ) -> None:
+            target_results[method_name] = metrics
+            if args.disable_artifacts:
+                return
+            if model is not None:
+                save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, method_name, model)
+            save_window_metrics_artifact(run_dir, data, target_id, target_test, args.seed, method_name, "test", metrics)
+            if normalized_outputs is not None:
+                y_true_norm, y_pred_norm = normalized_outputs
+                save_prediction_artifact(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    method_name,
+                    "test",
+                    y_true_norm,
+                    y_pred_norm,
+                    normalization_train_days=args.target_train_days,
+                    extras=extras,
+                )
+            elif raw_outputs is not None:
+                y_true_raw, y_pred_raw = raw_outputs
+                save_prediction_artifact_raw(
+                    run_dir,
+                    data,
+                    target_id,
+                    target_test,
+                    args.seed,
+                    method_name,
+                    "test",
+                    y_true_raw,
+                    y_pred_raw,
+                    extras=extras,
+                )
 
         if "persistence" in args.methods:
             print(f"Target {target_id} | persistence")
+            method_start = time.perf_counter()
             y_true, y_pred = build_persistence_predictions(target_test)
-            target_results["persistence"] = evaluate_task_predictions(
+            metrics = evaluate_task_predictions(
                 data,
                 target_id,
                 target_test,
@@ -364,25 +569,18 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
-            if not args.disable_artifacts:
-                save_prediction_artifact(
-                    run_dir,
-                    data,
-                    target_id,
-                    target_test,
-                    args.seed,
-                    "persistence",
-                    "test",
-                    y_true,
-                    y_pred,
-                    normalization_train_days=args.target_train_days,
-                )
+            finalize_method("persistence", metrics, normalized_outputs=(y_true, y_pred))
+            record_runtime(runtime_rows, target_id, "persistence", "total", time.perf_counter() - method_start, device)
 
-        if "ridge_local" in args.methods:
-            print(f"Target {target_id} | ridge_local")
-            ridge_local = fit_ridge_multioutput(x_train_local, y_train_local, alpha=args.ridge_alpha)
-            y_pred = ridge_local.predict(x_test).astype(np.float32)
-            target_results["ridge_local"] = evaluate_task_predictions(
+        if "ridge" in args.methods:
+            print(f"Target {target_id} | ridge")
+            fit_start = time.perf_counter()
+            ridge_model = fit_ridge_multioutput(x_train_local, y_train_local, alpha=args.ridge_alpha)
+            fit_duration = time.perf_counter() - fit_start
+            pred_start = time.perf_counter()
+            y_pred = ridge_model.predict(x_test).astype(np.float32)
+            predict_duration = time.perf_counter() - pred_start
+            metrics = evaluate_task_predictions(
                 data,
                 target_id,
                 target_test,
@@ -390,30 +588,25 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
-            if not args.disable_artifacts:
-                save_prediction_artifact(
-                    run_dir,
-                    data,
-                    target_id,
-                    target_test,
-                    args.seed,
-                    "ridge_local",
-                    "test",
-                    y_true_test,
-                    y_pred,
-                    normalization_train_days=args.target_train_days,
-                )
+            finalize_method("ridge", metrics, normalized_outputs=(y_true_test, y_pred))
+            record_runtime(runtime_rows, target_id, "ridge", "fit", fit_duration, device)
+            record_runtime(runtime_rows, target_id, "ridge", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "ridge", "total", fit_duration + predict_duration, device)
 
-        if "lgbm_local" in args.methods:
-            print(f"Target {target_id} | lgbm_local")
-            lgbm_local = fit_lgbm_multioutput(
+        if "lightgbm" in args.methods:
+            print(f"Target {target_id} | lightgbm")
+            fit_start = time.perf_counter()
+            lightgbm_model = fit_lgbm_multioutput(
                 x_train_local,
                 y_train_local,
                 n_estimators=args.lgbm_estimators,
                 random_state=args.seed,
             )
-            y_pred = predict_lgbm(lgbm_local, x_test)
-            target_results["lgbm_local"] = evaluate_task_predictions(
+            fit_duration = time.perf_counter() - fit_start
+            pred_start = time.perf_counter()
+            y_pred = predict_lgbm(lightgbm_model, x_test)
+            predict_duration = time.perf_counter() - pred_start
+            metrics = evaluate_task_predictions(
                 data,
                 target_id,
                 target_test,
@@ -421,19 +614,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
-            if not args.disable_artifacts:
-                save_prediction_artifact(
-                    run_dir,
-                    data,
-                    target_id,
-                    target_test,
-                    args.seed,
-                    "lgbm_local",
-                    "test",
-                    y_true_test,
-                    y_pred,
-                    normalization_train_days=args.target_train_days,
-                )
+            finalize_method("lightgbm", metrics, normalized_outputs=(y_true_test, y_pred))
+            record_runtime(runtime_rows, target_id, "lightgbm", "fit", fit_duration, device)
+            record_runtime(runtime_rows, target_id, "lightgbm", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "lightgbm", "total", fit_duration + predict_duration, device)
 
         if "lgbm_transfer" in args.methods and source_ids:
             print(f"Target {target_id} | lgbm_transfer")
@@ -446,14 +630,18 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 x_source, y_source = build_tabular_matrix(source_train)
                 x_parts.append(x_source)
                 y_parts.append(y_source)
+            fit_start = time.perf_counter()
             lgbm_transfer = fit_lgbm_multioutput(
                 np.concatenate(x_parts, axis=0),
                 np.concatenate(y_parts, axis=0),
                 n_estimators=args.lgbm_estimators,
                 random_state=args.seed + 11,
             )
+            fit_duration = time.perf_counter() - fit_start
+            pred_start = time.perf_counter()
             y_pred = predict_lgbm(lgbm_transfer, x_test)
-            target_results["lgbm_transfer"] = evaluate_task_predictions(
+            predict_duration = time.perf_counter() - pred_start
+            metrics = evaluate_task_predictions(
                 data,
                 target_id,
                 target_test,
@@ -461,22 +649,59 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
-            if not args.disable_artifacts:
-                save_prediction_artifact(
-                    run_dir,
-                    data,
-                    target_id,
-                    target_test,
-                    args.seed,
-                    "lgbm_transfer",
-                    "test",
-                    y_true_test,
-                    y_pred,
-                    normalization_train_days=args.target_train_days,
-                )
+            finalize_method("lgbm_transfer", metrics, normalized_outputs=(y_true_test, y_pred))
+            record_runtime(runtime_rows, target_id, "lgbm_transfer", "fit", fit_duration, device)
+            record_runtime(runtime_rows, target_id, "lgbm_transfer", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "lgbm_transfer", "total", fit_duration + predict_duration, device)
 
-        if any(method in args.methods for method in ("tcn_local", "safe_tcn")):
-            print(f"Target {target_id} | tcn_local train")
+        nf_methods = [method for method in args.methods if method in NF_METHODS]
+        if nf_methods:
+            _, train_model_frame = data.get_frame(target_id, "train", train_days_limit=args.target_train_days)
+            _, val_model_frame = data.get_frame(target_id, "val")
+            _, test_model_frame = data.get_frame(target_id, "test")
+            for method_name in nf_methods:
+                print(f"Target {target_id} | {method_name}")
+                bundle = fit_nf_model(
+                    method_name,
+                    train_frame=train_model_frame,
+                    val_frame=val_model_frame,
+                    spec=data.spec,
+                    feature_cols=data.feature_cols,
+                    input_size=args.seq_len,
+                    h=args.pred_len,
+                    seed=args.seed,
+                    device=str(device),
+                    args=args,
+                )
+                pred_start = time.perf_counter()
+                _, y_pred_raw = predict_nf_windows(
+                    bundle,
+                    test_frame=test_model_frame,
+                    spec=data.spec,
+                    feature_cols=data.feature_cols,
+                    window_indices=target_test.indices,
+                    seq_len=args.seq_len,
+                    pred_len=args.pred_len,
+                )
+                predict_duration = time.perf_counter() - pred_start
+                metrics = evaluate_task_predictions_raw(
+                    data,
+                    target_test,
+                    y_true_test_raw,
+                    y_pred_raw,
+                )
+                finalize_method(
+                    method_name,
+                    metrics,
+                    raw_outputs=(y_true_test_raw, y_pred_raw),
+                    model=bundle.fitted_model,
+                )
+                record_runtime(runtime_rows, target_id, method_name, "fit", bundle.fit_duration_sec, device)
+                record_runtime(runtime_rows, target_id, method_name, "predict", predict_duration, device)
+                record_runtime(runtime_rows, target_id, method_name, "total", bundle.fit_duration_sec + predict_duration, device)
+
+        if any(method in args.methods for method in ("tcn", "safe_tcn")):
+            print(f"Target {target_id} | tcn")
             local_model = train_local_model(
                 make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim),
                 train_loader,
@@ -489,8 +714,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 weight_decay=args.weight_decay,
                 patience=args.patience,
             )
+            pred_start = time.perf_counter()
             y_true, y_pred = collect_local_predictions(local_model, test_loader, target_profile, device)
-            target_results["tcn_local"] = evaluate_task_predictions(
+            predict_duration = time.perf_counter() - pred_start
+            metrics = evaluate_task_predictions(
                 data,
                 target_id,
                 target_test,
@@ -498,22 +725,46 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 y_pred,
                 normalization_train_days=args.target_train_days,
             )
-            if not args.disable_artifacts:
-                save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "tcn_local", local_model)
-                save_prediction_artifact(
-                    run_dir,
-                    data,
-                    target_id,
-                    target_test,
-                    args.seed,
-                    "tcn_local",
-                    "test",
-                    y_true,
-                    y_pred,
-                    normalization_train_days=args.target_train_days,
-                )
+            finalize_method("tcn", metrics, normalized_outputs=(y_true, y_pred), model=local_model)
+            tcn_fit_duration = float(getattr(local_model, "_training_summary", {}).get("duration_sec", 0.0))
+            record_runtime(runtime_rows, target_id, "tcn", "fit", tcn_fit_duration, device)
+            record_runtime(runtime_rows, target_id, "tcn", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "tcn", "total", tcn_fit_duration + predict_duration, device)
 
-        if any(method in args.methods for method in ("fine_tune", "safe_tcn")) and source_ids:
+        if "tcn_multi_task" in args.methods:
+            print(f"Target {target_id} | tcn_multi_task")
+            multi_task_ids = source_ids + [target_id]
+            multi_train = data.make_multitask_dataset(multi_task_ids, "train", stride=args.train_stride)
+            multi_model = train_multitask_target_model(
+                make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim),
+                loader_for(multi_train, args.batch_size, True, args.num_workers),
+                val_loader,
+                profile_bank_tensor.to(device),
+                target_profile,
+                device,
+                epochs=args.pretrain_epochs,
+                lr=args.lr_pretrain,
+                weight_decay=args.weight_decay,
+                patience=args.patience,
+            )
+            pred_start = time.perf_counter()
+            y_true, y_pred = collect_local_predictions(multi_model, test_loader, target_profile, device)
+            predict_duration = time.perf_counter() - pred_start
+            metrics = evaluate_task_predictions(
+                data,
+                target_id,
+                target_test,
+                y_true,
+                y_pred,
+                normalization_train_days=args.target_train_days,
+            )
+            finalize_method("tcn_multi_task", metrics, normalized_outputs=(y_true, y_pred), model=multi_model)
+            multi_fit_duration = float(getattr(multi_model, "_training_summary", {}).get("duration_sec", 0.0))
+            record_runtime(runtime_rows, target_id, "tcn_multi_task", "fit", multi_fit_duration, device)
+            record_runtime(runtime_rows, target_id, "tcn_multi_task", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "tcn_multi_task", "total", multi_fit_duration + predict_duration, device)
+
+        if any(method in args.methods for method in ("tcn_fine_tune", "safe_tcn")) and source_ids:
             print(f"Target {target_id} | multitask_pretrain")
             pretrain_train = data.make_multitask_dataset(source_ids, "train", stride=args.train_stride)
             pretrain_val = data.make_multitask_dataset(source_ids, "val", stride=args.eval_stride)
@@ -521,18 +772,19 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim),
                 loader_for(pretrain_train, args.batch_size, True, args.num_workers),
                 loader_for(pretrain_val, args.batch_size, False, args.num_workers),
-                torch.from_numpy(data.get_profiles(data.task_ids)).to(device),
+                profile_bank_tensor.to(device),
                 device,
                 epochs=args.pretrain_epochs,
                 lr=args.lr_pretrain,
                 weight_decay=args.weight_decay,
                 patience=args.patience,
             )
+            pretrain_duration = float(getattr(pretrain_model, "_training_summary", {}).get("duration_sec", 0.0))
             if not args.disable_artifacts:
                 save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "multitask_pretrain", pretrain_model)
 
-            if "fine_tune" in args.methods:
-                print(f"Target {target_id} | fine_tune")
+            if "tcn_fine_tune" in args.methods:
+                print(f"Target {target_id} | tcn_fine_tune")
                 fine_tune_model = make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim)
                 fine_tune_model.load_state_dict(pretrain_model.state_dict())
                 fine_tune_model = train_local_model(
@@ -547,8 +799,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     weight_decay=args.weight_decay,
                     patience=args.patience,
                 )
+                pred_start = time.perf_counter()
                 y_true, y_pred = collect_local_predictions(fine_tune_model, test_loader, target_profile, device)
-                target_results["fine_tune"] = evaluate_task_predictions(
+                predict_duration = time.perf_counter() - pred_start
+                metrics = evaluate_task_predictions(
                     data,
                     target_id,
                     target_test,
@@ -556,20 +810,12 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     y_pred,
                     normalization_train_days=args.target_train_days,
                 )
-                if not args.disable_artifacts:
-                    save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "fine_tune", fine_tune_model)
-                    save_prediction_artifact(
-                        run_dir,
-                        data,
-                        target_id,
-                        target_test,
-                        args.seed,
-                        "fine_tune",
-                        "test",
-                        y_true,
-                        y_pred,
-                        normalization_train_days=args.target_train_days,
-                    )
+                finalize_method("tcn_fine_tune", metrics, normalized_outputs=(y_true, y_pred), model=fine_tune_model)
+                fine_tune_duration = float(getattr(fine_tune_model, "_training_summary", {}).get("duration_sec", 0.0))
+                record_runtime(runtime_rows, target_id, "tcn_fine_tune", "pretrain", pretrain_duration, device)
+                record_runtime(runtime_rows, target_id, "tcn_fine_tune", "fit", fine_tune_duration, device)
+                record_runtime(runtime_rows, target_id, "tcn_fine_tune", "predict", predict_duration, device)
+                record_runtime(runtime_rows, target_id, "tcn_fine_tune", "total", pretrain_duration + fine_tune_duration + predict_duration, device)
 
             if "safe_tcn" in args.methods:
                 print(f"Target {target_id} | safe_tcn")
@@ -605,6 +851,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     harm_margin=args.harm_margin,
                     patience=args.patience,
                 )
+                calibrate_start = time.perf_counter()
                 safe_model = calibrate_safe_tcn(
                     safe_model,
                     val_loader,
@@ -615,6 +862,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     harm_limit=args.calibration_harm_limit,
                     grid_size=args.calibration_grid_size,
                 )
+                calibrate_duration = time.perf_counter() - calibrate_start
+                pred_start = time.perf_counter()
                 safe_outputs = collect_safe_outputs(
                     safe_model,
                     test_loader,
@@ -623,9 +872,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     relation_features=torch.from_numpy(relation_np),
                     device=device,
                 )
+                predict_duration = time.perf_counter() - pred_start
                 y_true = safe_outputs["truths"]
                 y_pred = safe_outputs["final"]
-                target_results["safe_tcn"] = evaluate_task_predictions(
+                metrics = evaluate_task_predictions(
                     data,
                     target_id,
                     target_test,
@@ -633,38 +883,25 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     y_pred,
                     normalization_train_days=args.target_train_days,
                 )
+                target_pred_denorm = denormalize_with_stats(data, target_id, safe_outputs["target"], normalization_train_days=args.target_train_days)
+                final_pred_denorm = denormalize_with_stats(data, target_id, safe_outputs["final"], normalization_train_days=args.target_train_days)
+                source_pred_denorm = denormalize_with_stats(
+                    data,
+                    target_id,
+                    safe_outputs["source_preds"],
+                    normalization_train_days=args.target_train_days,
+                )
+                prediction_extras = {
+                    "y_local": target_pred_denorm,
+                    "transfer_strength": safe_outputs["transfer_strength"],
+                    "raw_transfer": safe_outputs["raw_transfer"] * target_std,
+                    "bounded_transfer": safe_outputs["bounded_transfer"] * target_std,
+                    "transfer_delta": final_pred_denorm - target_pred_denorm,
+                    "residual_budget": safe_outputs["residual_budget"] * target_std,
+                    "calibration_alpha": safe_outputs["calibration_alpha"],
+                }
+                finalize_method("safe_tcn", metrics, normalized_outputs=(y_true, y_pred), extras=prediction_extras, model=safe_model)
                 if not args.disable_artifacts:
-                    target_pred_denorm = denormalize_with_stats(data, target_id, safe_outputs["target"], normalization_train_days=args.target_train_days)
-                    final_pred_denorm = denormalize_with_stats(data, target_id, safe_outputs["final"], normalization_train_days=args.target_train_days)
-                    source_pred_denorm = denormalize_with_stats(
-                        data,
-                        target_id,
-                        safe_outputs["source_preds"],
-                        normalization_train_days=args.target_train_days,
-                    )
-                    prediction_extras = {
-                        "y_local": target_pred_denorm,
-                        "transfer_strength": safe_outputs["transfer_strength"],
-                        "raw_transfer": safe_outputs["raw_transfer"] * target_std,
-                        "bounded_transfer": safe_outputs["bounded_transfer"] * target_std,
-                        "transfer_delta": final_pred_denorm - target_pred_denorm,
-                        "residual_budget": safe_outputs["residual_budget"] * target_std,
-                        "calibration_alpha": safe_outputs["calibration_alpha"],
-                    }
-                    save_training_history_artifact(run_dir, args.dataset, args.seed, target_id, "safe_tcn", safe_model)
-                    save_prediction_artifact(
-                        run_dir,
-                        data,
-                        target_id,
-                        target_test,
-                        args.seed,
-                        "safe_tcn",
-                        "test",
-                        y_true,
-                        y_pred,
-                        normalization_train_days=args.target_train_days,
-                        extras=prediction_extras,
-                    )
                     safe_source_frame = build_safe_source_frame(
                         spec=data.spec,
                         dataset=target_test,
@@ -682,8 +919,21 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                             safe_source_frame,
                             artifact_path(run_dir, "safe_sources", "safe_tcn", f"target_{target_id}_test.parquet"),
                         )
+                safe_fit_duration = float(getattr(safe_model, "_training_summary", {}).get("duration_sec", 0.0))
+                record_runtime(runtime_rows, target_id, "safe_tcn", "pretrain", pretrain_duration, device)
+                record_runtime(runtime_rows, target_id, "safe_tcn", "fit", safe_fit_duration, device)
+                record_runtime(runtime_rows, target_id, "safe_tcn", "calibrate", calibrate_duration, device)
+                record_runtime(runtime_rows, target_id, "safe_tcn", "predict", predict_duration, device)
+                record_runtime(
+                    runtime_rows,
+                    target_id,
+                    "safe_tcn",
+                    "total",
+                    pretrain_duration + safe_fit_duration + calibrate_duration + predict_duration,
+                    device,
+                )
 
-        add_transfer_safety(target_results, baseline_method="tcn_local")
+        add_transfer_safety(target_results, baseline_method="tcn")
         per_target[target_id] = target_results
 
     summary = summarize_results(per_target)
@@ -703,6 +953,9 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         if source_selection_frames:
             source_selection = pd.concat(source_selection_frames, ignore_index=True)
             save_parquet(source_selection, artifact_path(run_dir, "source_selection.parquet"))
+        runtime_frame = build_runtime_frame(args.dataset, args.seed, runtime_rows)
+        if not runtime_frame.empty:
+            save_parquet(runtime_frame, artifact_path(run_dir, "method_runtime.parquet"))
 
     print("\nSummary")
     for method, metrics in summary.items():
