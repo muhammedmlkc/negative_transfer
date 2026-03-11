@@ -39,8 +39,10 @@ from safe_tcn_lab.models import SafeTCNForecaster, TaskConditionedTCN
 from safe_tcn_lab.nf_baselines import NF_METHODS, fit_nf_model, predict_nf_windows
 from safe_tcn_lab.safe_patchtst import (
     fit_safe_fedformer,
+    fit_safe_gru,
     fit_safe_patchtst,
     predict_safe_fedformer,
+    predict_safe_gru,
     predict_safe_patchtst,
 )
 from safe_tcn_lab.train import (
@@ -103,7 +105,7 @@ PAPER_METHODS = [
     "safe_tcn",
 ]
 
-EXTRA_METHODS = ["lgbm_transfer", "safe_patchtst", "safe_fedformer"]
+EXTRA_METHODS = ["lgbm_transfer", "safe_patchtst", "safe_fedformer", "safe_gru"]
 
 ALL_METHODS = list(dict.fromkeys(CORE_METHODS + list(NF_METHODS) + PAPER_METHODS + EXTRA_METHODS))
 
@@ -972,6 +974,102 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
             record_runtime(runtime_rows, target_id, "safe_fedformer", "predict", predict_duration, device)
             record_runtime(runtime_rows, target_id, "safe_fedformer", "total", fit_duration_total + predict_duration, device)
 
+        if "safe_gru" in args.methods:
+            print(f"Target {target_id} | safe_gru")
+            _, train_model_frame = data.get_frame(target_id, "train", train_days_limit=args.target_train_days)
+            _, val_model_frame = data.get_frame(target_id, "val")
+            _, test_model_frame = data.get_frame(target_id, "test")
+            source_frames = []
+            for source_id, similarity in source_pairs:
+                _, source_train_frame = data.get_frame(source_id, "train")
+                _, source_val_frame = data.get_frame(source_id, "val")
+                source_frames.append((source_id, similarity, source_train_frame, source_val_frame))
+            safe_gru_fit_start = time.perf_counter()
+            safe_gru_bundle = fit_safe_gru(
+                spec=data.spec,
+                feature_cols=data.feature_cols,
+                input_size=args.seq_len,
+                h=args.pred_len,
+                target_train_frame=train_model_frame,
+                target_val_frame=val_model_frame,
+                target_val_indices=target_val.indices,
+                source_frames=source_frames,
+                seed=args.seed,
+                device=str(device),
+                args=args,
+                local_bundle=nf_bundles.get("gru"),
+            )
+            fit_duration = time.perf_counter() - safe_gru_fit_start
+            pred_start = time.perf_counter()
+            safe_gru_outputs = predict_safe_gru(
+                safe_gru_bundle,
+                test_frame=test_model_frame,
+                spec=data.spec,
+                feature_cols=data.feature_cols,
+                window_indices=target_test.indices,
+                seq_len=args.seq_len,
+                pred_len=args.pred_len,
+            )
+            predict_duration = time.perf_counter() - pred_start
+            y_true = safe_gru_outputs["truths"]
+            y_pred = safe_gru_outputs["final"]
+            metrics = evaluate_task_predictions_raw(
+                data,
+                target_test,
+                y_true,
+                y_pred,
+            )
+            prediction_extras = {
+                "y_local": safe_gru_outputs["local"],
+                "transfer_strength": safe_gru_outputs["transfer_strength"],
+                "raw_transfer": safe_gru_outputs["raw_transfer"],
+                "bounded_transfer": safe_gru_outputs["bounded_transfer"],
+                "transfer_delta": safe_gru_outputs["transfer_delta"],
+                "residual_budget": safe_gru_outputs["residual_budget"],
+                "calibration_alpha": safe_gru_outputs["calibration_alpha"],
+                "regime_score": safe_gru_outputs["regime_score"],
+                "regime_bin": safe_gru_outputs["regime_bin"],
+                "horizon_block": safe_gru_outputs["horizon_block"],
+                "source_dispersion": safe_gru_outputs["source_dispersion"],
+            }
+            finalize_method(
+                "safe_gru",
+                metrics,
+                raw_outputs=(y_true, y_pred),
+                extras=prediction_extras,
+                model=safe_gru_bundle,
+            )
+            if not args.disable_artifacts:
+                safe_source_frame = build_safe_source_frame(
+                    spec=data.spec,
+                    dataset=target_test,
+                    dataset_name=args.dataset,
+                    seed=args.seed,
+                    target_id=target_id,
+                    split="test",
+                    source_ids=safe_gru_bundle.source_ids,
+                    source_preds=safe_gru_outputs["source_preds"],
+                    source_weights=safe_gru_outputs["source_weights"],
+                    source_gates=safe_gru_outputs["source_gates"],
+                )
+                if not safe_source_frame.empty:
+                    save_parquet(
+                        safe_source_frame,
+                        artifact_path(run_dir, "safe_sources", "safe_gru", f"target_{target_id}_test.parquet"),
+                    )
+            fit_duration_total = float(getattr(safe_gru_bundle, "_training_summary", {}).get("duration_sec", fit_duration))
+            calibration_duration = float(getattr(safe_gru_bundle, "_training_summary", {}).get("calibration_duration_sec", 0.0))
+            source_fit_duration = float(getattr(safe_gru_bundle, "_training_summary", {}).get("source_fit_duration_sec", 0.0))
+            if getattr(safe_gru_bundle, "reused_local_bundle", False):
+                record_runtime(runtime_rows, target_id, "safe_gru", "local_fit_reused", 0.0, device)
+            else:
+                local_fit_duration = float(getattr(safe_gru_bundle.local_bundle, "fit_duration_sec", 0.0))
+                record_runtime(runtime_rows, target_id, "safe_gru", "local_fit", local_fit_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_gru", "source_fit", source_fit_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_gru", "calibrate", calibration_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_gru", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_gru", "total", fit_duration_total + predict_duration, device)
+
         if any(method in args.methods for method in ("tcn", "safe_tcn")):
             print(f"Target {target_id} | tcn")
             local_model = train_local_model(
@@ -1243,6 +1341,12 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
             target_results,
             method="safe_fedformer",
             baseline_method="fedformer",
+            prefix="LOCAL_",
+        )
+        add_method_relative_safety(
+            target_results,
+            method="safe_gru",
+            baseline_method="gru",
             prefix="LOCAL_",
         )
         per_target[target_id] = target_results
