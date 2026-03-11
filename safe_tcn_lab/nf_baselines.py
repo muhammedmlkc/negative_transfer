@@ -121,6 +121,14 @@ def _history_summary_rows(model, duration_sec: float) -> list[dict[str, float]]:
 def make_nf_model(method: str, h: int, input_size: int, feature_cols: Sequence[str], seed: int, device: str, args) -> object:
     require_neuralforecast()
     alias = method
+    dataloader_kwargs = {
+        "num_workers": max(0, args.num_workers),
+        "pin_memory": bool(device.startswith("cuda") and not args.disable_pin_memory),
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = not args.disable_persistent_workers
+        if args.prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
     common = {
         "h": h,
         "input_size": input_size,
@@ -142,6 +150,7 @@ def make_nf_model(method: str, h: int, input_size: int, feature_cols: Sequence[s
         "accelerator": "gpu" if device.startswith("cuda") else "cpu",
         "devices": 1,
         "alias": alias,
+        "dataloader_kwargs": dataloader_kwargs,
     }
     if method in FUTR_EXOG_METHODS:
         common["futr_exog_list"] = list(feature_cols)
