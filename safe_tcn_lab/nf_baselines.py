@@ -139,7 +139,6 @@ def make_nf_model(method: str, h: int, input_size: int, feature_cols: Sequence[s
         "enable_checkpointing": False,
         "num_sanity_val_steps": 0,
         "log_every_n_steps": max(1, min(50, args.nf_val_check_steps)),
-        "deterministic": True,
         "accelerator": "gpu" if device.startswith("cuda") else "cpu",
         "devices": 1,
         "alias": alias,
