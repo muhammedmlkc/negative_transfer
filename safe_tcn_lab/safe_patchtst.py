@@ -13,6 +13,7 @@ from safe_tcn_lab.nf_baselines import NFModelBundle, fit_nf_model, predict_nf_wi
 
 @dataclass
 class SafePatchTSTBundle:
+    backbone_method: str
     local_bundle: NFModelBundle
     source_bundles: list[NFModelBundle]
     source_ids: list[int]
@@ -302,11 +303,76 @@ def fit_safe_patchtst(
     args,
     local_bundle: NFModelBundle | None = None,
 ) -> SafePatchTSTBundle:
+    return _fit_safe_nf_transfer(
+        backbone_method="patchtst",
+        spec=spec,
+        feature_cols=feature_cols,
+        input_size=input_size,
+        h=h,
+        target_train_frame=target_train_frame,
+        target_val_frame=target_val_frame,
+        target_val_indices=target_val_indices,
+        source_frames=source_frames,
+        seed=seed,
+        device=device,
+        args=args,
+        local_bundle=local_bundle,
+    )
+
+
+def fit_safe_fedformer(
+    *,
+    spec: DatasetSpec,
+    feature_cols: Sequence[str],
+    input_size: int,
+    h: int,
+    target_train_frame: pd.DataFrame,
+    target_val_frame: pd.DataFrame,
+    target_val_indices: Sequence[int],
+    source_frames: Sequence[tuple[int, float, pd.DataFrame, pd.DataFrame]],
+    seed: int,
+    device: str,
+    args,
+    local_bundle: NFModelBundle | None = None,
+) -> SafePatchTSTBundle:
+    return _fit_safe_nf_transfer(
+        backbone_method="fedformer",
+        spec=spec,
+        feature_cols=feature_cols,
+        input_size=input_size,
+        h=h,
+        target_train_frame=target_train_frame,
+        target_val_frame=target_val_frame,
+        target_val_indices=target_val_indices,
+        source_frames=source_frames,
+        seed=seed,
+        device=device,
+        args=args,
+        local_bundle=local_bundle,
+    )
+
+
+def _fit_safe_nf_transfer(
+    *,
+    backbone_method: str,
+    spec: DatasetSpec,
+    feature_cols: Sequence[str],
+    input_size: int,
+    h: int,
+    target_train_frame: pd.DataFrame,
+    target_val_frame: pd.DataFrame,
+    target_val_indices: Sequence[int],
+    source_frames: Sequence[tuple[int, float, pd.DataFrame, pd.DataFrame]],
+    seed: int,
+    device: str,
+    args,
+    local_bundle: NFModelBundle | None = None,
+) -> SafePatchTSTBundle:
     fit_start = time.perf_counter()
     reused_local_bundle = local_bundle is not None
     if local_bundle is None:
         local_bundle = fit_nf_model(
-            "patchtst",
+            backbone_method,
             train_frame=target_train_frame,
             val_frame=target_val_frame,
             spec=spec,
@@ -323,7 +389,7 @@ def fit_safe_patchtst(
     similarities: list[float] = []
     for rank, (source_id, similarity, source_train_frame, source_val_frame) in enumerate(source_frames):
         bundle = fit_nf_model(
-            "patchtst",
+            backbone_method,
             train_frame=source_train_frame,
             val_frame=source_val_frame,
             spec=spec,
@@ -425,6 +491,7 @@ def fit_safe_patchtst(
     summary["safe_patch_horizon_blocks"] = int(args.safe_patch_horizon_blocks)
 
     return SafePatchTSTBundle(
+        backbone_method=backbone_method,
         local_bundle=local_bundle,
         source_bundles=source_bundles,
         source_ids=source_ids,
@@ -532,3 +599,24 @@ def predict_safe_patchtst(
         "horizon_block": horizon_block,
         "source_dispersion": dispersion.astype(np.float32),
     }
+
+
+def predict_safe_fedformer(
+    bundle: SafePatchTSTBundle,
+    *,
+    test_frame: pd.DataFrame,
+    spec: DatasetSpec,
+    feature_cols: Sequence[str],
+    window_indices: Sequence[int],
+    seq_len: int,
+    pred_len: int,
+) -> dict[str, np.ndarray]:
+    return predict_safe_patchtst(
+        bundle,
+        test_frame=test_frame,
+        spec=spec,
+        feature_cols=feature_cols,
+        window_indices=window_indices,
+        seq_len=seq_len,
+        pred_len=pred_len,
+    )
