@@ -94,29 +94,45 @@ def evaluate_predictions(
     return evaluate_generic(y_true, y_pred, rated_capacity=rated_capacity)
 
 
+def add_relative_safety(metrics: Dict[str, float], baseline: Dict[str, float], prefix: str = "") -> None:
+    base_mae = baseline["MAE"]
+    base_rmse = baseline["RMSE"]
+    metrics[f"{prefix}NTRI_MAE"] = negative_transfer_relative_impact(base_mae, metrics["MAE"])
+    metrics[f"{prefix}NTRI_RMSE"] = negative_transfer_relative_impact(base_rmse, metrics["RMSE"])
+    metrics[f"{prefix}NEG_TRANSFER_RMSE"] = float(metrics["RMSE"] > base_rmse)
+    metrics[f"{prefix}NEG_TRANSFER_MAE"] = float(metrics["MAE"] > base_mae)
+    base_window_rmse = baseline.get("_WINDOW_RMSE")
+    contender_rmse = metrics.get("_WINDOW_RMSE")
+    if base_window_rmse is not None and contender_rmse is not None:
+        base_arr = np.asarray(base_window_rmse, dtype=np.float64)
+        contender_arr = np.asarray(contender_rmse, dtype=np.float64)
+        paired = min(len(base_arr), len(contender_arr))
+        if paired > 0:
+            harm = contender_arr[:paired] > base_arr[:paired]
+            metrics[f"{prefix}WINDOW_HARM_RATE"] = float(np.mean(harm))
+            metrics[f"{prefix}WORST_RMSE_REGRET"] = float(np.max(contender_arr[:paired] - base_arr[:paired]))
+
+
 def add_transfer_safety(per_target: Dict[str, Dict[str, float]], baseline_method: str = "tcn") -> None:
     if baseline_method not in per_target:
         return
     baseline = per_target[baseline_method]
-    base_mae = baseline["MAE"]
-    base_rmse = baseline["RMSE"]
-    base_window_rmse = baseline.get("_WINDOW_RMSE")
     for method, metrics in per_target.items():
         if method.startswith("_") or method == baseline_method:
             continue
-        metrics["NTRI_MAE"] = negative_transfer_relative_impact(base_mae, metrics["MAE"])
-        metrics["NTRI_RMSE"] = negative_transfer_relative_impact(base_rmse, metrics["RMSE"])
-        metrics["NEG_TRANSFER_RMSE"] = float(metrics["RMSE"] > base_rmse)
-        metrics["NEG_TRANSFER_MAE"] = float(metrics["MAE"] > base_mae)
-        contender_rmse = metrics.get("_WINDOW_RMSE")
-        if base_window_rmse is not None and contender_rmse is not None:
-            base_arr = np.asarray(base_window_rmse, dtype=np.float64)
-            contender_arr = np.asarray(contender_rmse, dtype=np.float64)
-            paired = min(len(base_arr), len(contender_arr))
-            if paired > 0:
-                harm = contender_arr[:paired] > base_arr[:paired]
-                metrics["WINDOW_HARM_RATE"] = float(np.mean(harm))
-                metrics["WORST_RMSE_REGRET"] = float(np.max(contender_arr[:paired] - base_arr[:paired]))
+        add_relative_safety(metrics, baseline, prefix="")
+
+
+def add_method_relative_safety(
+    per_target: Dict[str, Dict[str, float]],
+    *,
+    method: str,
+    baseline_method: str,
+    prefix: str = "LOCAL_",
+) -> None:
+    if method not in per_target or baseline_method not in per_target:
+        return
+    add_relative_safety(per_target[method], per_target[baseline_method], prefix=prefix)
 
 
 def summarize_results(all_results: Dict[int, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
@@ -144,6 +160,10 @@ def summarize_results(all_results: Dict[int, Dict[str, Dict[str, float]]]) -> Di
             "NTRI_RMSE",
             "WINDOW_HARM_RATE",
             "WORST_RMSE_REGRET",
+            "LOCAL_NTRI_MAE",
+            "LOCAL_NTRI_RMSE",
+            "LOCAL_WINDOW_HARM_RATE",
+            "LOCAL_WORST_RMSE_REGRET",
         ):
             values = [row.get(metric, math.nan) for row in rows]
             finite = [value for value in values if np.isfinite(value)]
@@ -157,4 +177,12 @@ def summarize_results(all_results: Dict[int, Dict[str, Dict[str, float]]]) -> Di
                 summary[method]["NEG_TRANSFER_RATE_RMSE_PCT"] = float(100.0 * np.mean(neg_rmse))
             if neg_mae:
                 summary[method]["NEG_TRANSFER_RATE_MAE_PCT"] = float(100.0 * np.mean(neg_mae))
+            local_neg_rmse = [row.get("LOCAL_NEG_TRANSFER_RMSE", math.nan) for row in rows]
+            local_neg_mae = [row.get("LOCAL_NEG_TRANSFER_MAE", math.nan) for row in rows]
+            local_neg_rmse = [value for value in local_neg_rmse if np.isfinite(value)]
+            local_neg_mae = [value for value in local_neg_mae if np.isfinite(value)]
+            if local_neg_rmse:
+                summary[method]["LOCAL_NEG_TRANSFER_RATE_RMSE_PCT"] = float(100.0 * np.mean(local_neg_rmse))
+            if local_neg_mae:
+                summary[method]["LOCAL_NEG_TRANSFER_RATE_MAE_PCT"] = float(100.0 * np.mean(local_neg_mae))
     return summary

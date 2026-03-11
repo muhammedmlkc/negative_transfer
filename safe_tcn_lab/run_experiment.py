@@ -34,9 +34,10 @@ from safe_tcn_lab.baselines import (
     predict_lgbm,
 )
 from safe_tcn_lab.data import MultiTaskForecastData, get_dataset_spec
-from safe_tcn_lab.metrics import add_transfer_safety, evaluate_predictions, summarize_results
+from safe_tcn_lab.metrics import add_method_relative_safety, add_transfer_safety, evaluate_predictions, summarize_results
 from safe_tcn_lab.models import SafeTCNForecaster, TaskConditionedTCN
 from safe_tcn_lab.nf_baselines import NF_METHODS, fit_nf_model, predict_nf_windows
+from safe_tcn_lab.safe_patchtst import fit_safe_patchtst, predict_safe_patchtst
 from safe_tcn_lab.train import (
     calibrate_safe_tcn,
     collect_local_predictions,
@@ -97,7 +98,7 @@ PAPER_METHODS = [
     "safe_tcn",
 ]
 
-EXTRA_METHODS = ["lgbm_transfer"]
+EXTRA_METHODS = ["lgbm_transfer", "safe_patchtst"]
 
 ALL_METHODS = list(dict.fromkeys(CORE_METHODS + list(NF_METHODS) + PAPER_METHODS + EXTRA_METHODS))
 
@@ -578,6 +579,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         x_test, _ = build_tabular_matrix(target_test)
         local_model = None
         pretrain_model = None
+        nf_bundles: Dict[str, object] = {}
 
         def finalize_method(
             method_name: str,
@@ -763,9 +765,102 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                     raw_outputs=(y_true_test_raw, y_pred_raw),
                     model=bundle.fitted_model,
                 )
+                nf_bundles[method_name] = bundle
                 record_runtime(runtime_rows, target_id, method_name, "fit", bundle.fit_duration_sec, device)
                 record_runtime(runtime_rows, target_id, method_name, "predict", predict_duration, device)
                 record_runtime(runtime_rows, target_id, method_name, "total", bundle.fit_duration_sec + predict_duration, device)
+
+        if "safe_patchtst" in args.methods:
+            print(f"Target {target_id} | safe_patchtst")
+            _, train_model_frame = data.get_frame(target_id, "train", train_days_limit=args.target_train_days)
+            _, val_model_frame = data.get_frame(target_id, "val")
+            _, test_model_frame = data.get_frame(target_id, "test")
+            source_frames = []
+            for source_id, similarity in source_pairs:
+                _, source_train_frame = data.get_frame(source_id, "train")
+                _, source_val_frame = data.get_frame(source_id, "val")
+                source_frames.append((source_id, similarity, source_train_frame, source_val_frame))
+            safe_patch_fit_start = time.perf_counter()
+            safe_patch_bundle = fit_safe_patchtst(
+                spec=data.spec,
+                feature_cols=data.feature_cols,
+                input_size=args.seq_len,
+                h=args.pred_len,
+                target_train_frame=train_model_frame,
+                target_val_frame=val_model_frame,
+                target_val_indices=target_val.indices,
+                source_frames=source_frames,
+                seed=args.seed,
+                device=str(device),
+                args=args,
+                local_bundle=nf_bundles.get("patchtst"),
+            )
+            fit_duration = time.perf_counter() - safe_patch_fit_start
+            pred_start = time.perf_counter()
+            safe_patch_outputs = predict_safe_patchtst(
+                safe_patch_bundle,
+                test_frame=test_model_frame,
+                spec=data.spec,
+                feature_cols=data.feature_cols,
+                window_indices=target_test.indices,
+                seq_len=args.seq_len,
+                pred_len=args.pred_len,
+            )
+            predict_duration = time.perf_counter() - pred_start
+            y_true = safe_patch_outputs["truths"]
+            y_pred = safe_patch_outputs["final"]
+            metrics = evaluate_task_predictions_raw(
+                data,
+                target_test,
+                y_true,
+                y_pred,
+            )
+            prediction_extras = {
+                "y_local": safe_patch_outputs["local"],
+                "transfer_strength": safe_patch_outputs["transfer_strength"],
+                "raw_transfer": safe_patch_outputs["raw_transfer"],
+                "bounded_transfer": safe_patch_outputs["bounded_transfer"],
+                "transfer_delta": safe_patch_outputs["transfer_delta"],
+                "residual_budget": safe_patch_outputs["residual_budget"],
+                "calibration_alpha": safe_patch_outputs["calibration_alpha"],
+            }
+            finalize_method(
+                "safe_patchtst",
+                metrics,
+                raw_outputs=(y_true, y_pred),
+                extras=prediction_extras,
+                model=safe_patch_bundle,
+            )
+            if not args.disable_artifacts:
+                safe_source_frame = build_safe_source_frame(
+                    spec=data.spec,
+                    dataset=target_test,
+                    dataset_name=args.dataset,
+                    seed=args.seed,
+                    target_id=target_id,
+                    split="test",
+                    source_ids=safe_patch_bundle.source_ids,
+                    source_preds=safe_patch_outputs["source_preds"],
+                    source_weights=safe_patch_outputs["source_weights"],
+                    source_gates=safe_patch_outputs["source_gates"],
+                )
+                if not safe_source_frame.empty:
+                    save_parquet(
+                        safe_source_frame,
+                        artifact_path(run_dir, "safe_sources", "safe_patchtst", f"target_{target_id}_test.parquet"),
+                    )
+            fit_duration_total = float(getattr(safe_patch_bundle, "_training_summary", {}).get("duration_sec", fit_duration))
+            calibration_duration = float(getattr(safe_patch_bundle, "_training_summary", {}).get("calibration_duration_sec", 0.0))
+            source_fit_duration = float(getattr(safe_patch_bundle, "_training_summary", {}).get("source_fit_duration_sec", 0.0))
+            if getattr(safe_patch_bundle, "reused_local_bundle", False):
+                record_runtime(runtime_rows, target_id, "safe_patchtst", "local_fit_reused", 0.0, device)
+            else:
+                local_fit_duration = float(getattr(safe_patch_bundle.local_bundle, "fit_duration_sec", 0.0))
+                record_runtime(runtime_rows, target_id, "safe_patchtst", "local_fit", local_fit_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_patchtst", "source_fit", source_fit_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_patchtst", "calibrate", calibration_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_patchtst", "predict", predict_duration, device)
+            record_runtime(runtime_rows, target_id, "safe_patchtst", "total", fit_duration_total + predict_duration, device)
 
         if any(method in args.methods for method in ("tcn", "safe_tcn")):
             print(f"Target {target_id} | tcn")
@@ -1028,6 +1123,12 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
                 )
 
         add_transfer_safety(target_results, baseline_method="tcn")
+        add_method_relative_safety(
+            target_results,
+            method="safe_patchtst",
+            baseline_method="patchtst",
+            prefix="LOCAL_",
+        )
         per_target[target_id] = target_results
 
     summary = summarize_results(per_target)
