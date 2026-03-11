@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+$cudaCheck = python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"
+if ($LASTEXITCODE -ne 0) {
+    throw "Local Python environment is using CPU-only PyTorch. Install a CUDA-enabled PyTorch build before running GEFCom on the local GPU."
+}
+
 $common = @(
     "--dataset", "gefcom",
     "--max_sources", "2",
@@ -53,4 +58,11 @@ $sweepArgs = @(
 )
 
 & python @benchmarkArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "GEFCom benchmark failed. Sweep was not started."
+}
+
 & python @sweepArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "GEFCom sweep failed."
+}

@@ -31,6 +31,7 @@ docs/PUBLISHABLE_DIRECTION.md
 # Experiment outputs
 safe_tcn_lab/outputs/
 safe_tcn_lab/benchmark_outputs/
+safe_tcn_lab/final_runs/
 safe_tcn_lab/transfer_sweeps/
 safe_tcn_lab/transfer_sweeps_main/
 safe_tcn_lab/tmp_artifact_checks/
