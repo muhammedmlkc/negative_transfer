@@ -137,6 +137,17 @@ def get_device(device_name: str | None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def configure_torch_runtime(device: torch.device, matmul_precision: str, allow_tf32: bool) -> None:
+    if device.type != "cuda":
+        return
+    torch.set_float32_matmul_precision(matmul_precision)
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.cudnn.benchmark = True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SAFE-TCN wind power forecasting experiments")
     parser.add_argument("--dataset", choices=["sdwpf", "gefcom"], required=True)
@@ -151,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_stride", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--disable_pin_memory", action="store_true")
+    parser.add_argument("--disable_persistent_workers", action="store_true")
+    parser.add_argument("--matmul_precision", choices=["highest", "high", "medium"], default="high")
+    parser.add_argument("--disable_tf32", action="store_true")
     parser.add_argument("--n_pc_bins", type=int, default=20)
     parser.add_argument("--max_rows_per_task", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -238,8 +254,27 @@ def make_model(args: argparse.Namespace, input_dim: int, profile_dim: int) -> Ta
     )
 
 
-def loader_for(dataset, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+def loader_for(
+    dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    device: torch.device,
+    *,
+    prefetch_factor: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+) -> DataLoader:
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory and device.type == "cuda",
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **kwargs)
 
 
 def evaluate_task_predictions(
@@ -422,6 +457,11 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
 
     set_seed(args.seed)
     device = get_device(args.device)
+    configure_torch_runtime(
+        device,
+        matmul_precision=args.matmul_precision,
+        allow_tf32=not args.disable_tf32,
+    )
     spec = get_dataset_spec(args.dataset)
     data = MultiTaskForecastData(
         spec=spec,
@@ -485,9 +525,36 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
             print(f"Target {target_id} skipped due to empty split.")
             continue
 
-        train_loader = loader_for(target_train, args.batch_size, True, args.num_workers)
-        val_loader = loader_for(target_val, args.batch_size, False, args.num_workers)
-        test_loader = loader_for(target_test, args.batch_size, False, args.num_workers)
+        train_loader = loader_for(
+            target_train,
+            args.batch_size,
+            True,
+            args.num_workers,
+            device,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=not args.disable_pin_memory,
+            persistent_workers=not args.disable_persistent_workers,
+        )
+        val_loader = loader_for(
+            target_val,
+            args.batch_size,
+            False,
+            args.num_workers,
+            device,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=not args.disable_pin_memory,
+            persistent_workers=not args.disable_persistent_workers,
+        )
+        test_loader = loader_for(
+            target_test,
+            args.batch_size,
+            False,
+            args.num_workers,
+            device,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=not args.disable_pin_memory,
+            persistent_workers=not args.disable_persistent_workers,
+        )
 
         target_profile_np = data.get_profile(target_id, train_days_limit=args.target_train_days).astype(np.float32)
         target_profile = torch.from_numpy(target_profile_np)
@@ -737,7 +804,16 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
             multi_train = data.make_multitask_dataset(multi_task_ids, "train", stride=args.train_stride)
             multi_model = train_multitask_target_model(
                 make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim),
-                loader_for(multi_train, args.batch_size, True, args.num_workers),
+                loader_for(
+                    multi_train,
+                    args.batch_size,
+                    True,
+                    args.num_workers,
+                    device,
+                    prefetch_factor=args.prefetch_factor,
+                    pin_memory=not args.disable_pin_memory,
+                    persistent_workers=not args.disable_persistent_workers,
+                ),
                 val_loader,
                 profile_bank_tensor.to(device),
                 target_profile,
@@ -770,8 +846,26 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
             pretrain_val = data.make_multitask_dataset(source_ids, "val", stride=args.eval_stride)
             pretrain_model = train_multitask_pretrain(
                 make_model(args, input_dim=len(data.feature_cols) + 1, profile_dim=data.profile_dim),
-                loader_for(pretrain_train, args.batch_size, True, args.num_workers),
-                loader_for(pretrain_val, args.batch_size, False, args.num_workers),
+                loader_for(
+                    pretrain_train,
+                    args.batch_size,
+                    True,
+                    args.num_workers,
+                    device,
+                    prefetch_factor=args.prefetch_factor,
+                    pin_memory=not args.disable_pin_memory,
+                    persistent_workers=not args.disable_persistent_workers,
+                ),
+                loader_for(
+                    pretrain_val,
+                    args.batch_size,
+                    False,
+                    args.num_workers,
+                    device,
+                    prefetch_factor=args.prefetch_factor,
+                    pin_memory=not args.disable_pin_memory,
+                    persistent_workers=not args.disable_persistent_workers,
+                ),
                 profile_bank_tensor.to(device),
                 device,
                 epochs=args.pretrain_epochs,

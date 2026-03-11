@@ -43,7 +43,9 @@ def fit_ridge_multioutput(x_train: np.ndarray, y_train: np.ndarray, alpha: float
         Pipeline(
             [
                 ("scale", StandardScaler()),
-                ("ridge", Ridge(alpha=alpha)),
+                # SVD is slower than the closed-form positive solve, but it is
+                # much more stable for our highly correlated window features.
+                ("ridge", Ridge(alpha=alpha, solver="svd")),
             ]
         )
     )
